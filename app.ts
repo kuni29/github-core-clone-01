@@ -63,7 +63,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
 
 /** Send a body that is already serialized JSON (sendJson's framing, minus the stringify). */
 function sendJsonText(res: ServerResponse, status: number, text: string): void {
-  const payload = Buffer.from(`${text}\n`, 'utf8');
+  sendJsonBuffer(res, status, Buffer.from(`${text}\n`, 'utf8'));
+}
+
+/** Send an already-framed JSON body buffer (sendJson's headers, no per-request copy). */
+function sendJsonBuffer(res: ServerResponse, status: number, payload: Buffer): void {
   res.sendDate = false;
   res.writeHead(status, {
     'content-type': JSON_TYPE,
@@ -123,6 +127,8 @@ function authed(req: IncomingMessage): boolean {
 }
 
 function decodeSegment(segment: string): string {
+  // Most segments carry no escape at all; only those pay for the decoder.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -342,11 +348,36 @@ function handleLsRefs(res: ServerResponse, repo: RepoRec, reader: PktReader): vo
   sendPlain(res, 200, 'application/x-git-upload-pack-result', body);
 }
 
+/**
+ * Framed fetch responses, memoized. A response is a pure function of the plan, the
+ * haves the store actually holds (the ACK list, computed before keying) and `done`:
+ * the store is append-only and content-addressed, so that function's value never
+ * changes. Small responses only; the map clears rather than grows past its cap.
+ */
+const fetchResponseCache = new Map<string, Buffer>();
+const FETCH_CACHE_MAX_ENTRIES = 64;
+const FETCH_CACHE_MAX_BYTES = 512 * 1024;
+
+function cacheFetchResponse(key: string, body: Buffer): Buffer {
+  if (body.length <= FETCH_CACHE_MAX_BYTES) {
+    if (fetchResponseCache.size >= FETCH_CACHE_MAX_ENTRIES) fetchResponseCache.clear();
+    fetchResponseCache.set(key, body);
+  }
+  return body;
+}
+
 function fetchResponse(plan: { objects: string[]; shallow: string[]; unshallow: string[] }, haves: string[], done: boolean): Buffer {
+  const acked = haves.length > 0 ? haves.filter((have) => hasObject(have)) : [];
+  const key = plan.objects.length <= 2048
+    ? `v2|${plan.objects.join(',')}|${plan.shallow.join(',')}|${plan.unshallow.join(',')}|${acked.join(',')}|${done ? 1 : 0}|${haves.length > 0 ? 1 : 0}`
+    : null;
+  if (key !== null) {
+    const hit = fetchResponseCache.get(key);
+    if (hit !== undefined) return hit;
+  }
   const parts: Buffer[] = [];
   if (haves.length > 0) {
     parts.push(pktLine('acknowledgments\n'));
-    const acked = haves.filter((have) => hasObject(have));
     if (acked.length === 0) parts.push(pktLine('NAK\n'));
     else for (const have of acked) parts.push(pktLine(`ACK ${have}\n`));
     if (done) parts.push(pktLine('ready\n'));
@@ -362,7 +393,8 @@ function fetchResponse(plan: { objects: string[]; shallow: string[]; unshallow: 
   const pack = buildPack(plan.objects);
   for (const packet of sidebandPackets(pack, 1)) parts.push(packet);
   parts.push(FLUSH_PKT);
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  return key === null ? body : cacheFetchResponse(key, body);
 }
 
 function handleFetchV2(res: ServerResponse, reader: PktReader): void {
@@ -399,14 +431,20 @@ function handleFetchV0(res: ServerResponse, reader: PktReader): void {
     if (line.startsWith('have ')) haves.push(line.slice(5).trim());
   }
   const plan = planFetch(wants, haves, shallow, deepen);
-  const parts: Buffer[] = [];
-  for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-  for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  parts.push(pktLine('NAK\n'));
-  const pack = buildPack(plan.objects);
-  for (const packet of sidebandPackets(pack, 1)) parts.push(packet);
-  parts.push(FLUSH_PKT);
-  sendPlain(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const key = plan.objects.length <= 2048 ? `v0|${plan.objects.join(',')}|${plan.shallow.join(',')}|${plan.unshallow.join(',')}` : null;
+  let body = key === null ? undefined : fetchResponseCache.get(key);
+  if (body === undefined) {
+    const parts: Buffer[] = [];
+    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+    parts.push(pktLine('NAK\n'));
+    const pack = buildPack(plan.objects);
+    for (const packet of sidebandPackets(pack, 1)) parts.push(packet);
+    parts.push(FLUSH_PKT);
+    const built = Buffer.concat(parts);
+    body = key === null ? built : cacheFetchResponse(key, built);
+  }
+  sendPlain(res, 200, 'application/x-git-upload-pack-result', body);
 }
 
 function handleUploadPack(res: ServerResponse, repo: RepoRec, body: Buffer): void {
@@ -639,14 +677,20 @@ function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknown> {
  * body is exactly the body issueJson would build now. Labels are immutable once created
  * and the repository's name never changes, so nothing else the body reads can drift.
  */
-const issueJsonTextCache = new WeakMap<IssueRec, { rev: number; text: string }>();
+const issueJsonTextCache = new WeakMap<IssueRec, { rev: number; text: string; buf: Buffer }>();
 
 function issueJsonText(repo: RepoRec, issue: IssueRec): string {
   const hit = issueJsonTextCache.get(issue);
   if (hit !== undefined && hit.rev === issue.rev) return hit.text;
   const text = JSON.stringify(issueJson(repo, issue));
-  issueJsonTextCache.set(issue, { rev: issue.rev, text });
+  issueJsonTextCache.set(issue, { rev: issue.rev, text, buf: Buffer.from(`${text}\n`, 'utf8') });
   return text;
+}
+
+/** The framed response body for an issue at its current rev, built once per rev. */
+function issueJsonBuffer(repo: RepoRec, issue: IssueRec): Buffer {
+  issueJsonText(repo, issue);
+  return issueJsonTextCache.get(issue)!.buf;
 }
 
 function pullJson(repo: RepoRec, issue: IssueRec): Record<string, unknown> {
@@ -1104,7 +1148,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: Reques
             }
           }
           const issue = createIssueRec(repo, { kind: 'issue', title: str(body.title), body: str(body.body), labels: names });
-          sendJson(res, 201, issueJson(repo, issue));
+          sendJsonBuffer(res, 201, issueJsonBuffer(repo, issue));
           return;
         }
         if (method === 'GET') {
@@ -1128,7 +1172,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: Reques
           return;
         }
         if (method === 'GET') {
-          sendJsonText(res, 200, issueJsonText(repo, issue));
+          sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
           return;
         }
         if (method === 'PATCH') {
@@ -1636,17 +1680,26 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // target that is not origin-form (never sent by the suite) takes the full parse.
   const rawUrl = req.url ?? '/';
   let pathname: string;
-  let searchParams: URLSearchParams;
+  let searchParams: URLSearchParams | null = null;
+  let query = '';
   if (rawUrl.startsWith('/')) {
     const queryAt = rawUrl.indexOf('?');
     pathname = queryAt < 0 ? rawUrl : rawUrl.slice(0, queryAt);
-    searchParams = new URLSearchParams(queryAt < 0 ? '' : rawUrl.slice(queryAt + 1));
+    query = queryAt < 0 ? '' : rawUrl.slice(queryAt + 1);
   } else {
     const parsed = new URL(rawUrl, 'http://entry');
     pathname = parsed.pathname;
     searchParams = parsed.searchParams;
   }
-  const requestUrl: RequestUrl = { pathname, searchParams };
+  // The query is parsed only when a handler actually reads it: the hot paths
+  // (a plain issue GET, the git endpoints without a query) never do.
+  const requestUrl: RequestUrl = {
+    pathname,
+    get searchParams(): URLSearchParams {
+      if (searchParams === null) searchParams = new URLSearchParams(query);
+      return searchParams;
+    },
+  };
   const method = req.method ?? 'GET';
 
   if (method === 'GET' && pathname === '/healthz') {

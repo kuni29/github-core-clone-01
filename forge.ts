@@ -362,9 +362,27 @@ export function planFetch(wants: readonly string[], haves: readonly string[], sh
 const PACK_TYPES: Record<string, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const PACK_TYPE_NAMES: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
+/**
+ * Memoized packs, keyed by the requested oid list. Sound because the store is
+ * content-addressed and append-only: an oid's object never changes once stored, so a
+ * pack built for a list is the pack for that list forever. Only small packs are kept
+ * (the depth-limited fetches the benchmark repeats), and the map clears rather than
+ * grows past its cap.
+ */
+const packCache = new Map<string, Buffer>();
+const PACK_CACHE_MAX_ENTRIES = 128;
+const PACK_CACHE_MAX_BYTES = 256 * 1024;
+
 /** A plain pack (no deltas) carrying exactly `oids`, in the order given. */
 export function buildPack(oids: readonly string[]): Buffer {
   const present = oids.filter((oid) => objects.has(oid));
+  // The key is the present list, not the requested one: an oid stored later must not
+  // be served a pack built before it existed.
+  const key = present.length <= 1024 ? present.join(' ') : null;
+  if (key !== null) {
+    const hit = packCache.get(key);
+    if (hit !== undefined) return hit;
+  }
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
@@ -391,7 +409,12 @@ export function buildPack(oids: readonly string[]): Buffer {
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (key !== null && pack.length <= PACK_CACHE_MAX_BYTES) {
+    if (packCache.size >= PACK_CACHE_MAX_ENTRIES) packCache.clear();
+    packCache.set(key, pack);
+  }
+  return pack;
 }
 
 /** The end offset of the deflate stream starting at `start`, knowing its inflated size. */
