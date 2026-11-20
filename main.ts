@@ -1,3 +1,23 @@
+// github-core-clone-01: a GitHub-compatible git forge in a single Node process, written for the
+// make.fun github-core-clone-01 bounty. It speaks git smart HTTP (upload-pack protocol v2 with a
+// v0 fallback, receive-pack v0), the REST v3 API, GraphQL v4 and an MCP endpoint, so a stock git
+// client and the suite's API checks both talk to it as if it were GitHub. There is no git binary
+// and no dependency: Node's standard library only (node:http, node:crypto, node:zlib), and every
+// byte of state lives in this process's memory.
+//
+// The code splits three ways. forge.ts is the store: a content-addressed git object store (blobs,
+// trees, commits, tags; pack build/unpack with delta resolution) plus the per-repository records
+// for refs, labels, issues and pull requests — deterministic, with server-made commit timestamps
+// taken from a per-repo counter rather than the clock. app.ts is the HTTP surface: its createApp()
+// builds the node:http server that routes the git, REST and MCP endpoints over forge.ts and hands
+// GraphQL documents to gql.ts, a small parser/executor that runs queries and mutations against the
+// same store. Nothing persists between processes: every trial starts from an empty store, and
+// the env writes the state export the scorer reads once this process exits.
+//
+// This file is only the entrypoint. It imports createApp from app.ts, binds an ephemeral port,
+// registers that port with the env named by MAKEFUN_ENV_URL, polls the env until the trial is
+// done, then closes the server and exits 0 — the lifecycle the block below documents in detail.
+
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.

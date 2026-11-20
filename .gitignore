@@ -1,2 +1,3 @@
 node_modules/
 *.log
+# github-core-clone-01 entry workspace: dependencies and local run logs stay out of the entry.
