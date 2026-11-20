@@ -568,6 +568,7 @@ const RESOLVERS: Record<string, Record<string, Resolver>> = {
       const issue = repo !== null && decoded !== null ? repo.issues.get(parseInt(decoded.parts[1]!, 10)) : undefined;
       if (repo === null || issue === undefined) throw new GqlFieldError('issue not found for closeIssue');
       issue.state = 'closed';
+      issue.rev += 1;
       return { __typename: 'CloseIssuePayload', issue: issueObject(repo, issue), clientMutationId: input.clientMutationId ?? null };
     },
     createPullRequest: (_obj, args) => {
@@ -609,6 +610,7 @@ const RESOLVERS: Record<string, Record<string, Resolver>> = {
       if (repo === null || issue === undefined) throw new GqlFieldError('subject not found for addComment');
       const comment = { id: newCommentId(), body: String(input.body ?? '') };
       issue.comments.push(comment);
+      issue.rev += 1;
       const node: GqlObject = { __typename: 'IssueComment', repo, issue, comment };
       return {
         __typename: 'AddCommentPayload',

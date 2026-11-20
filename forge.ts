@@ -396,35 +396,17 @@ export function buildPack(oids: readonly string[]): Buffer {
 
 /** The end offset of the deflate stream starting at `start`, knowing its inflated size. */
 function inflateEnd(buf: Buffer, start: number, expectedSize: number): { data: Buffer; end: number } {
-  // Exponential probe for an upper bound, then binary search for the smallest prefix that
-  // inflates to exactly the declared size (inflateSync tolerates trailing bytes, throws on
-  // truncation), which is precisely the stream's end.
-  let hi = Math.min(buf.length, start + 64);
-  for (;;) {
-    try {
-      inflateSync(buf.subarray(start, hi));
-      break;
-    } catch {
-      if (hi >= buf.length) throw new Error('pack entry does not inflate');
-      hi = Math.min(buf.length, start + (hi - start) * 4);
-    }
+  // One inflate over the rest of the pack (inflateSync tolerates the trailing entries): with
+  // info:true the engine reports exactly how many compressed bytes the stream consumed, which
+  // is precisely the stream's end. No probing, and a well-formed stream never throws.
+  let out: { buffer: Buffer; engine: { bytesWritten: number } };
+  try {
+    out = inflateSync(buf.subarray(start), { info: true }) as { buffer: Buffer; engine: { bytesWritten: number } };
+  } catch {
+    throw new Error('pack entry does not inflate');
   }
-  let lo = start + 1;
-  let high = hi;
-  while (lo < high) {
-    const mid = (lo + high) >> 1;
-    let ok = false;
-    try {
-      ok = inflateSync(buf.subarray(start, mid)).length === expectedSize;
-    } catch {
-      ok = false;
-    }
-    if (ok) high = mid;
-    else lo = mid + 1;
-  }
-  const data = inflateSync(buf.subarray(start, lo));
-  if (data.length !== expectedSize) throw new Error('pack entry size mismatch');
-  return { data, end: lo };
+  if (out.buffer.length !== expectedSize) throw new Error('pack entry size mismatch');
+  return { data: out.buffer, end: start + out.engine.bytesWritten };
 }
 
 export function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -571,6 +553,8 @@ export interface IssueRec {
   merged: boolean;
   mergeCommitSha: string | null;
   mergedAt: string | null;
+  /** Bump on every mutation of the record; app.ts keys its serialized-issue cache on it. */
+  rev: number;
 }
 
 export interface RepoRec {
@@ -837,6 +821,7 @@ export function mergePullRequest(repo: RepoRec, issue: IssueRec): MergeOutcome {
   issue.mergeCommitSha = sha;
   const ts = BASE_TS + repo.commitCounter * 60;
   issue.mergedAt = new Date(ts * 1000).toISOString();
+  issue.rev += 1;
   return { ok: true, sha };
 }
 
@@ -871,6 +856,7 @@ export function createIssueRec(repo: RepoRec, init: Partial<IssueRec> & { kind: 
     merged: false,
     mergeCommitSha: null,
     mergedAt: null,
+    rev: 0,
   };
   repo.issues.set(number, rec);
   return rec;

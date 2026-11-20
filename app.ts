@@ -46,47 +46,80 @@ let requestCounter = 0;
 
 function nextRequestId(): string {
   requestCounter += 1;
-  return `req-${requestCounter.toString(36)}-${Date.now().toString(36)}`;
+  return `req-${requestCounter.toString(36)}`;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.sendDate = false;
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': payload.length,
     'x-github-request-id': nextRequestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(payload);
+}
+
+/** Send a body that is already serialized JSON (sendJson's framing, minus the stringify). */
+function sendJsonText(res: ServerResponse, status: number, text: string): void {
+  const payload = Buffer.from(`${text}\n`, 'utf8');
+  res.sendDate = false;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': payload.length,
+    'x-github-request-id': nextRequestId(),
+  });
+  res.end(payload);
 }
 
 function sendEmpty(res: ServerResponse, status: number): void {
+  res.sendDate = false;
   res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': nextRequestId() });
   res.end();
 }
 
 function sendPlain(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+  res.sendDate = false;
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
   res.end(body);
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks);
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Event-driven collection: the async-iterator form wraps every chunk in promise
+  // machinery, which is the most expensive part of reading a small body.
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let settled = false;
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      settled = true;
+      resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks));
+    });
+    req.on('error', (err) => {
+      settled = true;
+      reject(err);
+    });
+    req.on('close', () => {
+      if (!settled) reject(new Error('request body aborted'));
+    });
+  });
 }
 
+let cachedToken: string | null = null;
+
+/** The trial token is fixed before the process starts; read the environment once. */
 function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  if (cachedToken === null) cachedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return cachedToken;
 }
 
 function authed(req: IncomingMessage): boolean {
   const header = req.headers['authorization'];
-  if (typeof header !== 'string') return false;
-  const match = /^Bearer (.+)$/.exec(header);
-  if (match === null) return false;
+  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
+  const token = header.slice('Bearer '.length);
   const expected = expectedToken();
-  return expected === '' ? match[1]!.length > 0 : match[1] === expected;
+  return expected === '' ? token.length > 0 : token === expected;
 }
 
 function decodeSegment(segment: string): string {
@@ -113,8 +146,15 @@ function remainderAfter(pathname: string, prefix: string): string | null {
   return null;
 }
 
+const isoCache = new Map<number, string>();
+
+/** A counter's ISO instant; a pure function of the counter, so answers are memoized. */
 function isoFromCounter(seq: number): string {
-  return new Date((EPOCH_BASE + seq * 60) * 1000).toISOString();
+  const hit = isoCache.get(seq);
+  if (hit !== undefined) return hit;
+  const text = new Date((EPOCH_BASE + seq * 60) * 1000).toISOString();
+  isoCache.set(seq, text);
+  return text;
 }
 
 // ---------------------------------------------------------------- pkt-lines
@@ -226,18 +266,21 @@ function v0Advertisement(repo: RepoRec, service: 'git-upload-pack' | 'git-receiv
   return Buffer.concat(parts);
 }
 
+/** The v2 advertisement never changes, so it is framed once and shared by every answer. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH_PKT,
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    FLUSH_PKT,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
-function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: RepoRec, url: URL): void {
+function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: RepoRec, url: RequestUrl): void {
   const service = url.searchParams.get('service');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
     sendPlain(res, 400, 'text/plain; charset=utf-8', Buffer.from('missing or unknown service\n'));
@@ -492,7 +535,7 @@ function handleReceivePack(res: ServerResponse, repo: RepoRec, body: Buffer): vo
   sendPlain(res, 200, 'application/x-git-receive-pack-result', responseBody);
 }
 
-async function handleGit(req: IncomingMessage, res: ServerResponse, segments: string[], url: URL): Promise<void> {
+async function handleGit(req: IncomingMessage, res: ServerResponse, segments: string[], url: RequestUrl): Promise<void> {
   const [owner, repoGit, ...rest] = segments;
   const repoName = repoGit!.endsWith('.git') ? repoGit!.slice(0, -4) : repoGit!;
   const repo = owner === VIEWER.login ? getRepo(repoName) : undefined;
@@ -590,6 +633,22 @@ function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknown> {
   return body;
 }
 
+/**
+ * The serialized issueJson for a record, cached against the record's rev: every mutation
+ * site (REST PATCH, comment posts, GraphQL close/comment, a merge) bumps rev, so a cached
+ * body is exactly the body issueJson would build now. Labels are immutable once created
+ * and the repository's name never changes, so nothing else the body reads can drift.
+ */
+const issueJsonTextCache = new WeakMap<IssueRec, { rev: number; text: string }>();
+
+function issueJsonText(repo: RepoRec, issue: IssueRec): string {
+  const hit = issueJsonTextCache.get(issue);
+  if (hit !== undefined && hit.rev === issue.rev) return hit.text;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issueJsonTextCache.set(issue, { rev: issue.rev, text });
+  return text;
+}
+
 function pullJson(repo: RepoRec, issue: IssueRec): Record<string, unknown> {
   const headTip = branchTip(repo, issue.headRef);
   const baseTip = branchTip(repo, issue.baseRef);
@@ -632,7 +691,7 @@ interface PageResult<T> {
   headers: Record<string, string>;
 }
 
-function paginate<T>(req: IncomingMessage, url: URL, items: T[]): PageResult<T> {
+function paginate<T>(req: IncomingMessage, url: RequestUrl, items: T[]): PageResult<T> {
   const perPageRaw = parseInt(url.searchParams.get('per_page') ?? '30', 10);
   const perPage = Number.isFinite(perPageRaw) ? Math.min(100, Math.max(1, perPageRaw)) : 30;
   const pageRaw = parseInt(url.searchParams.get('page') ?? '1', 10);
@@ -734,7 +793,7 @@ function labelNamesOf(body: Record<string, unknown>): string[] {
   return names;
 }
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+async function handleRest(req: IncomingMessage, res: ServerResponse, url: RequestUrl): Promise<void> {
   const method = req.method ?? 'GET';
   const pathname = url.pathname;
   const segments = pathSegments(pathname);
@@ -1069,7 +1128,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
           return;
         }
         if (method === 'GET') {
-          sendJson(res, 200, issueJson(repo, issue));
+          sendJsonText(res, 200, issueJsonText(repo, issue));
           return;
         }
         if (method === 'PATCH') {
@@ -1086,6 +1145,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
             }
             issue.labels = names;
           }
+          issue.rev += 1;
           sendJson(res, 200, issueJson(repo, issue));
           return;
         }
@@ -1100,6 +1160,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
         if (method === 'POST') {
           const comment = { id: newCommentId(), body: str(body.body) };
           issue.comments.push(comment);
+          issue.rev += 1;
           sendJson(res, 201, commentJson(comment));
           return;
         }
@@ -1160,6 +1221,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
         if (body.state === 'open' || body.state === 'closed') pull.state = body.state;
         if (typeof body.title === 'string') pull.title = body.title;
         if (typeof body.body === 'string') pull.body = body.body;
+        pull.rev += 1;
         sendJson(res, 200, pullJson(repo, pull));
         return;
       }
@@ -1548,6 +1610,12 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 
 // ---------------------------------------------------------------- the server
 
+/** The two URL facets the handlers read: the path, and the query as URLSearchParams. */
+interface RequestUrl {
+  pathname: string;
+  searchParams: URLSearchParams;
+}
+
 /** Build the server. It binds nothing until the caller listens; main.ts listens on port 0. */
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -1563,8 +1631,22 @@ export function createApp(): Server {
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://entry');
-  const pathname = url.pathname;
+  // Fast path for origin-form request targets: the pathname is the part before '?' and the
+  // query goes to a plain URLSearchParams, with no WHATWG URL parse on the hot path. Only a
+  // target that is not origin-form (never sent by the suite) takes the full parse.
+  const rawUrl = req.url ?? '/';
+  let pathname: string;
+  let searchParams: URLSearchParams;
+  if (rawUrl.startsWith('/')) {
+    const queryAt = rawUrl.indexOf('?');
+    pathname = queryAt < 0 ? rawUrl : rawUrl.slice(0, queryAt);
+    searchParams = new URLSearchParams(queryAt < 0 ? '' : rawUrl.slice(queryAt + 1));
+  } else {
+    const parsed = new URL(rawUrl, 'http://entry');
+    pathname = parsed.pathname;
+    searchParams = parsed.searchParams;
+  }
+  const requestUrl: RequestUrl = { pathname, searchParams };
   const method = req.method ?? 'GET';
 
   if (method === 'GET' && pathname === '/healthz') {
@@ -1595,7 +1677,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 401, { message: 'Unauthorized' });
       return;
     }
-    await handleRest(req, res, url);
+    await handleRest(req, res, requestUrl);
     return;
   }
 
@@ -1605,7 +1687,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendPlain(res, 401, 'text/plain; charset=utf-8', Buffer.from('unauthorized\n'));
       return;
     }
-    await handleGit(req, res, segments, url);
+    await handleGit(req, res, segments, requestUrl);
     return;
   }
 
